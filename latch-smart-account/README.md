@@ -45,6 +45,8 @@ fn upgrade(env: &Env, new_wasm_hash: BytesN<32>, operator: Address)
 
 **Inherited from `ExecutionEntryPoint`**: `execute(contract, function, args)` — calls another contract as this account. Requires self-auth.
 
+**Atomic Batch Execution & Rollback Guarantee**: When executing multi-step operations (`batch_add_signer` or multi-operation transactions dispatched through the smart account), execution is strictly atomic within the Soroban host frame — if step $N$ panics or fails validation (e.g. duplicate signer, policy rejection, or target contract revert), all state mutations from steps $1 \dots N-1$ are rolled back atomically.
+
 ---
 
 ## Key Concepts

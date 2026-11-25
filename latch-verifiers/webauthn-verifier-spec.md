@@ -246,6 +246,9 @@ impl Verifier for WebAuthnVerifier {
 - Pass three keys with credential ID suffixes
 - Output must have length 3, each entry equal to the first 65 bytes of the corresponding input
 
+### `verify` — origin mismatch / cross-origin rejection test
+- When an origin-pinned policy or origin-bound `clientDataJSON` digest is verified against an assertion signed for a mismatched origin (`https://attacker.example` vs `https://example.com`), the computed `SHA256(authenticatorData || SHA256(clientDataJSON))` digest diverges from the expected origin-bound payload and `secp256r1_verify` rejects the assertion (`Error(Crypto, InvalidInput)`).
+
 ---
 
 ## Relationship to Other Verifiers

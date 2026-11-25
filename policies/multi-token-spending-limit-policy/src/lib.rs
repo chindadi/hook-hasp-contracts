@@ -11,12 +11,14 @@
 //! # Units and decimal normalization
 //!
 //! `spending_limit_usd` and the tracked totals in [`PolicyData`] are in
-//! **whole US dollars** (integer; sub-dollar transfers truncate toward zero).
+//! **whole US dollars** (integer). Sub-unit transfers are rounded **up** to 1
+//! to prevent zero-charge exploits where many tiny fractional transfers bypass
+//! the limit entirely due to truncation.
 //! A raw `transfer` amount arrives in the token's own smallest unit, so the
 //! USD value of a transfer is
 //!
 //! ```text
-//! amount_usd = amount * price / 10^oracle_decimals / 10^token_decimals
+//! amount_usd = ceil(amount * price / (10^oracle_decimals * 10^token_decimals))
 //! ```
 //!
 //! Both `10^oracle_decimals` (from the oracle's `decimals()`) and each token's
@@ -111,18 +113,34 @@ pub enum Error {
     /// (`amount * price` before scaling down). Fails closed rather than
     /// wrapping or saturating to a value that could misstate the spend.
     AmountConversionOverflow = 12,
+    /// Adding the new transfer's USD value to the running total, or summing
+    /// evicted entries, overflowed `i128`. Fails closed rather than
+    /// silently saturating to a capped value that could understate the spend.
+    SpendingTotalOverflow = 13,
+    /// Multiplying `MAX_STALENESS_LEDGERS * LEDGER_CLOSE_TIME_SECS` overflowed
+    /// `u64`. Fails closed rather than wrapping or saturating to a bound that
+    /// could accept stale prices.
+    StalenessBoundOverflow = 14,
+    /// The transfer amount was zero or negative. Zero-amount transfers must be
+    /// rejected explicitly so they cannot silently bypass accounting logic or
+    /// inflate the spending history with no-cost entries.
+    InvalidAmount = 15,
 }
 
 /// Installation parameters for the multi-token spending limit policy.
+///
+/// Fields are ordered with fixed-size scalars first to minimize Soroban XDR
+/// map-key overhead: shorter/scalar fields encode more compactly than
+/// variable-length ones.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MultiTokenSpendingLimitAccountParams {
+    /// The rolling window size, in ledgers, over which the limit applies.
+    pub period_ledgers: u32,
     /// The maximum amount that can be spent across `allowed_tokens` within
     /// `period_ledgers`, in **whole US dollars** (integer). Transfers worth
     /// less than $1 truncate toward zero for accounting purposes.
     pub spending_limit_usd: i128,
-    /// The rolling window size, in ledgers, over which the limit applies.
-    pub period_ledgers: u32,
     /// The SEP-40 / Reflector-compatible oracle contract queried for each
     /// token's USD price. Fixed at install time.
     pub oracle_address: Address,
@@ -131,26 +149,32 @@ pub struct MultiTokenSpendingLimitAccountParams {
 }
 
 /// Individual spending entry for rolling-window tracking.
+///
+/// `ledger` (u32, 4 bytes) is placed before `amount_usd` (i128, 16 bytes) so
+/// the shorter fixed-size field encodes first in XDR, reducing map-key
+/// overhead.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpendingEntry {
-    pub amount_usd: i128,
     pub ledger: u32,
+    pub amount_usd: i128,
 }
 
 /// Internal storage structure for a single `(smart_account, context_rule)`
 /// installation.
+///
+/// Fields are ordered with fixed-size scalars first to minimize Soroban XDR
+/// encoded footprint: scalars (u32, i128) encode before variable-length
+/// fields (Address, Vec), reducing per-entry storage rent.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyData {
     /// The rolling-window cap, in whole US dollars.
-    pub spending_limit_usd: i128,
     pub period_ledgers: u32,
-    pub oracle_address: Address,
-    /// `10.pow(oracle.decimals())`, queried once at install time and cached
-    /// so `enforce` doesn't need a second cross-contract call just to
-    /// convert a price into this policy's USD accounting.
     pub usd_divisor: i128,
+    pub spending_limit_usd: i128,
+    pub cached_total_spent_usd: i128,
+    pub oracle_address: Address,
     pub allowed_tokens: Vec<Address>,
     /// `10.pow(token.decimals())` for each entry in `allowed_tokens`, same
     /// order and length. Queried once per token at install time and used in
@@ -158,7 +182,6 @@ pub struct PolicyData {
     /// before pricing.
     pub token_divisors: Vec<i128>,
     pub spending_history: Vec<SpendingEntry>,
-    pub cached_total_spent_usd: i128,
 }
 
 #[contracttype]
@@ -213,7 +236,13 @@ fn get_policy_data(e: &Env, context_rule_id: u32, smart_account: &Address) -> Po
 /// Evicts spending entries older than the rolling window and returns the
 /// total USD amount removed, so the caller can keep `cached_total_spent_usd`
 /// in sync without re-summing the whole history.
+///
+/// Uses `checked_add` so an improbably large history (entries summing past
+/// `i128::MAX`) fails closed with [`Error::SpendingTotalOverflow`] rather
+/// than saturating to a capped total that could leave the cache inconsistent
+/// with the actual sum.
 fn cleanup_old_entries(
+    e: &Env,
     spending_history: &mut Vec<SpendingEntry>,
     current_ledger: u32,
     period_ledgers: u32,
@@ -225,7 +254,9 @@ fn cleanup_old_entries(
     // are always at the front.
     while let Some(entry) = spending_history.get(0) {
         if entry.ledger <= cutoff_ledger {
-            removed_total = removed_total.saturating_add(entry.amount_usd);
+            removed_total = removed_total
+                .checked_add(entry.amount_usd)
+                .unwrap_or_else(|| panic_with_error!(e, Error::SpendingTotalOverflow));
             spending_history.pop_front();
         } else {
             break;
@@ -295,14 +326,14 @@ impl Policy for MultiTokenSpendingLimitPolicy {
         }
 
         let data = PolicyData {
-            spending_limit_usd: install_params.spending_limit_usd,
             period_ledgers: install_params.period_ledgers,
-            oracle_address: install_params.oracle_address,
             usd_divisor,
+            spending_limit_usd: install_params.spending_limit_usd,
+            cached_total_spent_usd: 0,
+            oracle_address: install_params.oracle_address,
             allowed_tokens: install_params.allowed_tokens,
             token_divisors,
             spending_history: Vec::new(e),
-            cached_total_spent_usd: 0,
         };
 
         e.storage().persistent().set(&key, &data);
@@ -333,8 +364,10 @@ impl Policy for MultiTokenSpendingLimitPolicy {
     /// # Errors
     ///
     /// * [`Error::InvalidTransferArgs`] - When the context is not a
-    ///   `Context::Contract` invocation of `transfer`, the amount argument is
-    ///   missing or malformed, or the amount is negative.
+    ///   `Context::Contract` invocation of `transfer`, or the amount argument
+    ///   is missing or malformed.
+    /// * [`Error::InvalidAmount`] - When the transfer amount is zero or
+    ///   negative.
     /// * [`Error::TokenNotAllowed`] - When the target contract is not in the
     ///   installed allowlist.
     /// * [`Error::InvalidOracleResponse`] - When `lastprice` returns `None` for
@@ -372,8 +405,8 @@ impl Policy for MultiTokenSpendingLimitPolicy {
         let Ok(amount) = i128::try_from_val(e, &amount_val) else {
             panic_with_error!(e, Error::InvalidTransferArgs)
         };
-        if amount < 0 {
-            panic_with_error!(e, Error::InvalidTransferArgs)
+        if amount <= 0 {
+            panic_with_error!(e, Error::InvalidAmount)
         }
 
         let mut data = get_policy_data(e, context_rule.id, &smart_account);
@@ -398,29 +431,53 @@ impl Policy for MultiTokenSpendingLimitPolicy {
         let current_timestamp = e.ledger().timestamp();
         let current_ledger = e.ledger().sequence();
 
-        let max_staleness_secs = MAX_STALENESS_LEDGERS as u64 * LEDGER_CLOSE_TIME_SECS;
+        let max_staleness_secs = (MAX_STALENESS_LEDGERS as u64)
+            .checked_mul(LEDGER_CLOSE_TIME_SECS)
+            .unwrap_or_else(|| panic_with_error!(e, Error::StalenessBoundOverflow));
         if current_timestamp.saturating_sub(price_data.timestamp) > max_staleness_secs {
             panic_with_error!(e, Error::StaleOraclePrice)
         }
 
-        // `amount` is in the token's smallest unit. Normalize to a whole-token
-        // count (`/ token_divisor`) and drop the oracle's price precision
-        // (`/ usd_divisor`) to land in whole USD. `checked_*` so a huge
-        // `amount * price` fails closed instead of saturating to a valuation
-        // that no longer reflects the transfer.
-        let amount_usd = amount
+        // `amount` is in the token's smallest unit. Compute the combined
+        // divisor (oracle precision × token precision) and apply ceiling
+        // division so every non-zero transfer costs at least 1 USD unit.
+        // Ceiling division: ceil(a / b) = (a + b - 1) / b for positive a, b.
+        // This prevents the zero-charge exploit where many tiny sub-unit
+        // transfers each truncate to $0 and bypass the cap entirely.
+        // `checked_*` throughout so a huge `amount * price` or a combined
+        // divisor that overflows i128 both fail closed.
+        let product = amount
             .checked_mul(price_data.price)
-            .and_then(|v| v.checked_div(data.usd_divisor))
-            .and_then(|v| v.checked_div(token_divisor))
             .unwrap_or_else(|| panic_with_error!(e, Error::AmountConversionOverflow));
+
+        let divisor = data
+            .usd_divisor
+            .checked_mul(token_divisor)
+            .unwrap_or_else(|| panic_with_error!(e, Error::AmountConversionOverflow));
+
+        // A zero transfer records $0; ceiling only applies to positive products.
+        let amount_usd = if product == 0 {
+            0
+        } else {
+            product
+                .checked_add(divisor - 1)
+                .and_then(|v| v.checked_div(divisor))
+                .unwrap_or_else(|| panic_with_error!(e, Error::AmountConversionOverflow))
+        };
 
         // Clean up old entries outside the rolling window before checking
         // the limit, so the cached total matches the live window.
         let removed_amount =
-            cleanup_old_entries(&mut data.spending_history, current_ledger, data.period_ledgers);
-        data.cached_total_spent_usd = data.cached_total_spent_usd.saturating_sub(removed_amount);
+            cleanup_old_entries(e, &mut data.spending_history, current_ledger, data.period_ledgers);
+        data.cached_total_spent_usd = data.cached_total_spent_usd
+            .checked_sub(removed_amount)
+            .unwrap_or_else(|| panic_with_error!(e, Error::SpendingTotalOverflow));
 
-        if data.cached_total_spent_usd.saturating_add(amount_usd) > data.spending_limit_usd {
+        if data.cached_total_spent_usd
+            .checked_add(amount_usd)
+            .unwrap_or_else(|| panic_with_error!(e, Error::SpendingTotalOverflow))
+            > data.spending_limit_usd
+        {
             panic_with_error!(e, Error::SpendingLimitExceeded)
         }
 
@@ -428,8 +485,10 @@ impl Policy for MultiTokenSpendingLimitPolicy {
             panic_with_error!(e, Error::HistoryCapacityExceeded)
         }
 
-        data.spending_history.push_back(SpendingEntry { amount_usd, ledger: current_ledger });
-        data.cached_total_spent_usd = data.cached_total_spent_usd.saturating_add(amount_usd);
+        data.spending_history.push_back(SpendingEntry { ledger: current_ledger, amount_usd });
+        data.cached_total_spent_usd = data.cached_total_spent_usd
+            .checked_add(amount_usd)
+            .unwrap_or_else(|| panic_with_error!(e, Error::SpendingTotalOverflow));
 
         let key = DataKey::AccountContext(smart_account, context_rule.id);
         e.storage().persistent().set(&key, &data);
@@ -447,7 +506,27 @@ impl MultiTokenSpendingLimitPolicy {
     pub fn get_policy_data(e: &Env, context_rule_id: u32, smart_account: Address) -> PolicyData {
         get_policy_data(e, context_rule_id, &smart_account)
     }
+
+    /// Reclaims all persistent storage associated with this policy for the
+    /// given smart account and context rule. Unlike `uninstall`, this is
+    /// idempotent: it succeeds even when the entry is already absent or has
+    /// expired, allowing users to reclaim storage rent without a live entry.
+    /// Requires authorization from the smart account.
+    ///
+    /// # Arguments
+    ///
+    /// * `e` - Access to the Soroban environment.
+    /// * `context_rule_id` - The context rule ID for this policy.
+    /// * `smart_account` - The address of the smart account.
+    pub fn reclaim_storage(e: &Env, context_rule_id: u32, smart_account: Address) {
+        smart_account.require_auth();
+
+        let key = DataKey::AccountContext(smart_account, context_rule_id);
+        e.storage().persistent().remove(&key);
+    }
 }
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod boundary_test;

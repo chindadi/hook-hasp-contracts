@@ -3,23 +3,27 @@ extern crate std;
 use soroban_sdk::{
     auth::{Context, ContractContext, ContractExecutable, CreateContractHostFnContext},
     contract, symbol_short,
-    testutils::{Address as _, Events},
+    testutils::{Address as _, Events, Ledger as _},
     vec, Address, BytesN, Env, String, Vec,
 };
 use stellar_accounts::smart_account::{ContextRule, ContextRuleType, Signer};
 
-use crate::allowlist::*;
+use crate::{allowlist::*, SessionPolicy, SessionPolicyClient};
 
 #[contract]
 struct MockContract;
 
 fn create_context_rule(e: &Env) -> ContextRule {
+    create_context_rule_with_id(e, 1)
+}
+
+fn create_context_rule_with_id(e: &Env, id: u32) -> ContextRule {
     let signer = Address::generate(e);
     let mut signers = Vec::new(e);
     signers.push_back(Signer::Delegated(signer));
 
     ContextRule {
-        id: 1,
+        id,
         context_type: ContextRuleType::CallContract(Address::generate(e)),
         name: String::from_str(e, "session"),
         signers,
@@ -324,5 +328,314 @@ fn get_allowed_fns_returns_installed_value() {
     e.as_contract(&address, || {
         let allowed_fns = get_allowed_fns(&e, context_rule.id, &smart_account);
         assert_eq!(allowed_fns, vec![&e, symbol_short!("set"), symbol_short!("get")]);
+    });
+}
+
+#[test]
+fn check_policy_returns_true_for_allowed_fn() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        install(&e, &params, &context_rule, &smart_account);
+    });
+
+    e.as_contract(&address, || {
+        let (would_pass, fn_allowed) =
+            check_policy(&e, context_rule.id, &smart_account, &symbol_short!("set"));
+        assert!(would_pass);
+        assert!(fn_allowed);
+    });
+}
+
+#[test]
+fn check_policy_returns_false_for_not_installed() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+
+    e.as_contract(&address, || {
+        // Policy not installed — must return (false, false) without panicking.
+        let (would_pass, fn_allowed) =
+            check_policy(&e, context_rule.id, &smart_account, &symbol_short!("set"));
+        assert!(!would_pass);
+        assert!(!fn_allowed);
+    });
+}
+
+#[test]
+fn check_policy_returns_false_for_disallowed_fn() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        install(&e, &params, &context_rule, &smart_account);
+    });
+
+    e.as_contract(&address, || {
+        let (would_pass, fn_allowed) =
+            check_policy(&e, context_rule.id, &smart_account, &symbol_short!("delete"));
+        assert!(!would_pass);
+        assert!(!fn_allowed);
+    });
+}
+
+#[test]
+fn check_policy_does_not_mutate_state() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        install(&e, &params, &context_rule, &smart_account);
+    });
+
+    e.as_contract(&address, || {
+        // Calling check_policy twice must yield identical results.
+        let result_a = check_policy(&e, context_rule.id, &smart_account, &symbol_short!("set"));
+        let result_b = check_policy(&e, context_rule.id, &smart_account, &symbol_short!("set"));
+        assert_eq!(result_a, result_b);
+    });
+}
+
+#[test]
+fn create_session_accepts_expiry_at_max_duration() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let current_ledger = e.ledger().sequence();
+    let mut context_rule = create_context_rule(&e);
+    context_rule.valid_until = Some(current_ledger + MAX_SESSION_DURATION);
+
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        create_session(&e, &params, &context_rule, &smart_account);
+
+        assert!(!get_allowed_fns(&e, context_rule.id, &smart_account).is_empty());
+    });
+}
+
+#[test]
+fn create_session_accepts_rule_without_expiry() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        create_session(&e, &params, &context_rule, &smart_account);
+
+        assert_eq!(context_rule.valid_until, None);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn create_session_rejects_expiry_beyond_max_duration() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let current_ledger = e.ledger().sequence();
+    let mut context_rule = create_context_rule(&e);
+    context_rule.valid_until = Some(current_ledger + MAX_SESSION_DURATION + 1);
+
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        create_session(&e, &params, &context_rule, &smart_account);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn install_rejects_expiry_beyond_max_duration() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let current_ledger = e.ledger().sequence();
+    let mut context_rule = create_context_rule(&e);
+    context_rule.valid_until = Some(current_ledger + MAX_SESSION_DURATION * 2);
+
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        install(&e, &params, &context_rule, &smart_account);
+    });
+}
+
+#[test]
+fn expiry_within_max_duration_is_measured_against_current_ledger() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let mut context_rule = create_context_rule(&e);
+    let expiry = e.ledger().sequence() + MAX_SESSION_DURATION;
+    context_rule.valid_until = Some(expiry);
+
+    e.ledger().with_mut(|li| {
+        li.sequence_number = expiry - MAX_SESSION_DURATION / 2;
+    });
+    e.mock_all_auths();
+
+    e.as_contract(&address, || {
+        let params = SessionAccountParams { allowed_fns: vec![&e, symbol_short!("set")] };
+        install(&e, &params, &context_rule, &smart_account);
+    });
+}
+
+// ################## SESSION REVOCATION TESTS ##################
+//
+// Each authorization-requiring operation gets its own `as_contract` frame:
+// `mock_all_auths` authorizes one frame at a time, so chaining two
+// `require_auth` calls in a single frame fails with `Auth, ExistingValue`.
+
+fn install_session(e: &Env, policy: &Address, smart_account: &Address, rule: &ContextRule) {
+    let params = SessionAccountParams { allowed_fns: vec![e, symbol_short!("set")] };
+    e.as_contract(policy, || install(e, &params, rule, smart_account));
+}
+
+fn revoke_id(e: &Env, policy: &Address, smart_account: &Address, session_id: u32) {
+    e.as_contract(policy, || revoke_session(e, session_id, smart_account));
+}
+
+#[test]
+fn revoke_session_marks_session_as_revoked() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+
+    e.mock_all_auths();
+
+    install_session(&e, &address, &smart_account, &context_rule);
+    e.as_contract(&address, || {
+        assert!(!is_revoked(&e, context_rule.id, &smart_account));
+    });
+
+    e.as_contract(&address, || {
+        revoke_session(&e, context_rule.id, &smart_account);
+
+        assert!(is_revoked(&e, context_rule.id, &smart_account));
+        assert_eq!(e.events().all().events().len(), 1);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn revoked_session_enforcement_fails_immediately() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+    let context = create_contract_context(&e, symbol_short!("set"));
+
+    e.mock_all_auths();
+
+    install_session(&e, &address, &smart_account, &context_rule);
+    e.as_contract(&address, || {
+        enforce(&e, &context, &context_rule.signers, &context_rule, &smart_account);
+    });
+
+    revoke_id(&e, &address, &smart_account, context_rule.id);
+
+    e.as_contract(&address, || {
+        enforce(&e, &context, &context_rule.signers, &context_rule, &smart_account);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn revoke_session_rejects_unknown_session() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+
+    e.mock_all_auths();
+
+    revoke_id(&e, &address, &smart_account, 42);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn revoke_session_rejects_duplicate_revocation() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+
+    e.mock_all_auths();
+
+    install_session(&e, &address, &smart_account, &context_rule);
+    revoke_id(&e, &address, &smart_account, context_rule.id);
+    revoke_id(&e, &address, &smart_account, context_rule.id);
+}
+
+#[test]
+fn revocation_bitmap_isolates_sessions_and_accounts() {
+    let e = Env::default();
+    let address = e.register(MockContract, ());
+    let smart_account = Address::generate(&e);
+    let other_account = Address::generate(&e);
+    let first = create_context_rule_with_id(&e, 1);
+    let same_word = create_context_rule_with_id(&e, 2);
+    let next_word = create_context_rule_with_id(&e, REVOCATION_BITS_PER_WORD);
+
+    e.mock_all_auths();
+
+    for rule in [&first, &same_word, &next_word] {
+        install_session(&e, &address, &smart_account, rule);
+    }
+    install_session(&e, &address, &other_account, &first);
+    revoke_id(&e, &address, &smart_account, first.id);
+    revoke_id(&e, &address, &smart_account, next_word.id);
+
+    e.as_contract(&address, || {
+        assert!(is_revoked(&e, first.id, &smart_account));
+        assert!(is_revoked(&e, next_word.id, &smart_account));
+        assert!(!is_revoked(&e, same_word.id, &smart_account));
+        assert!(!is_revoked(&e, first.id, &other_account));
+
+        let context = create_contract_context(&e, symbol_short!("set"));
+        enforce(&e, &context, &same_word.signers, &same_word, &smart_account);
+    });
+}
+
+#[test]
+fn revoke_session_requires_smart_account_auth() {
+    let e = Env::default();
+    let address = e.register(SessionPolicy, ());
+    let smart_account = Address::generate(&e);
+    let context_rule = create_context_rule(&e);
+    let client = SessionPolicyClient::new(&e, &address);
+
+    e.mock_all_auths();
+    install_session(&e, &address, &smart_account, &context_rule);
+
+    e.set_auths(&[]);
+    assert!(client.try_revoke_session(&context_rule.id, &smart_account).is_err());
+    e.as_contract(&address, || {
+        assert!(!is_revoked(&e, context_rule.id, &smart_account));
     });
 }

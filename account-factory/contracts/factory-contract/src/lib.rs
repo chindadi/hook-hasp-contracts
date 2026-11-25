@@ -8,10 +8,29 @@ use stellar_accounts::{
     policies::simple_threshold::SimpleThresholdAccountParams, smart_account::Signer,
 };
 
+// ################## CONSTANTS ##################
+
+/// A ledger closes approximately every 5 seconds; 17 280 ledgers ≈ 1 day.
+const DAY_IN_LEDGERS: u32 = 17_280;
+
+/// Persistent entries are extended to this many ledgers on every write.
+/// 30 days worth of ledgers keeps deployed-account records alive well
+/// beyond any typical activity gap.
+const REGISTRY_EXTEND_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+
+/// Only extend when the remaining TTL falls below this threshold (29 days)
+/// to avoid paying for an extension on every call when the entry is fresh.
+const REGISTRY_TTL_THRESHOLD: u32 = REGISTRY_EXTEND_AMOUNT - DAY_IN_LEDGERS;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Config,
+    /// Persistent registry entry for a deployed account. The key is the
+    /// account address; the value is the ledger sequence at which it was
+    /// created. Stored as `Persistent` so it survives long dormancy with
+    /// TTL renewal on every `create_account` call.
+    AccountRegistry(Address),
 }
 
 #[contracttype]
@@ -63,6 +82,11 @@ pub enum FactoryError {
     MissingThreshold = 5,
     InvalidThreshold = 6,
     InvalidEd25519Key = 7,
+    /// An internal invariant was violated. This should never be reachable in
+    /// correct operation; it exists solely to give `.unwrap_or_else` a
+    /// `panic_with_error!` target that is unambiguously distinct from all
+    /// application-level errors.
+    InternalError = 8,
     InvalidWebAuthnKey = 9,
     InvalidEd25519Verifier = 10,
     InvalidWebAuthnVerifier = 12,
@@ -110,6 +134,26 @@ impl Contract {
         env.storage().instance().extend_ttl(100, 1_555_200);
     }
 
+    /// Computes the deterministic smart account address that will be deployed
+    /// for the given initialization parameters without actually deploying it.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - Access to the Soroban environment.
+    /// * `params` - Initialization parameters specifying the initial signers, threshold, and deploy salt.
+    ///
+    /// # Returns
+    ///
+    /// The deterministic address of the smart account.
+    ///
+    /// # Errors
+    ///
+    /// * [`FactoryError::NoSigners`] - If `signers` is empty.
+    /// * [`FactoryError::DuplicateSigner`] - If duplicate signers are detected after canonicalization.
+    /// * [`FactoryError::MissingThreshold`] - If threshold is missing when more than 1 signer is provided.
+    /// * [`FactoryError::InvalidThreshold`] - If threshold is 0 or exceeds the number of signers.
+    /// * [`FactoryError::InvalidEd25519Key`] - If an Ed25519 signer key length is not 32 bytes.
+    /// * [`FactoryError::InvalidWebAuthnKey`] - If a WebAuthn public key is less than 65 bytes or does not start with `0x04`.
     pub fn get_account_address(env: Env, params: AccountInitParams) -> Address {
         let normalized = normalize_params(&env, params);
         env.deployer()
@@ -117,6 +161,33 @@ impl Contract {
             .deployed_address()
     }
 
+    /// Deploys a new Latch smart account configured with the specified signers
+    /// and threshold policy. If an account at the deterministic address already exists,
+    /// returns its address idempotently without attempting redeployment.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - Access to the Soroban environment.
+    /// * `params` - Initialization parameters specifying initial signers, threshold, and deploy salt.
+    ///
+    /// # Returns
+    ///
+    /// The address of the deployed (or existing) smart account.
+    ///
+    /// # Errors
+    ///
+    /// * [`FactoryError::MissingConfig`] - If factory configuration is not set.
+    /// * [`FactoryError::NoSigners`] - If `signers` is empty.
+    /// * [`FactoryError::DuplicateSigner`] - If duplicate signers are detected.
+    /// * [`FactoryError::MissingThreshold`] - If threshold is omitted when multiple signers exist.
+    /// * [`FactoryError::InvalidThreshold`] - If threshold is zero or greater than the number of signers.
+    /// * [`FactoryError::InvalidEd25519Key`] - If an Ed25519 signer key length is not 32 bytes.
+    /// * [`FactoryError::InvalidWebAuthnKey`] - If a WebAuthn public key is invalid.
+    ///
+    /// # Events
+    ///
+    /// * topics - `["account_created"]`
+    /// * data - `[account: Address]`
     pub fn create_account(env: Env, params: AccountInitParams) -> Address {
         let config = get_config(&env);
         let normalized = normalize_params(&env, params);
@@ -125,6 +196,16 @@ impl Contract {
         let account_address = deployer.deployed_address();
 
         if account_address.executable().is_some() {
+            // Account already exists; still refresh its registry TTL so the
+            // entry does not expire while the account remains live.
+            let registry_key = DataKey::AccountRegistry(account_address.clone());
+            if env.storage().persistent().has(&registry_key) {
+                env.storage().persistent().extend_ttl(
+                    &registry_key,
+                    REGISTRY_TTL_THRESHOLD,
+                    REGISTRY_EXTEND_AMOUNT,
+                );
+            }
             return account_address;
         }
 
@@ -133,10 +214,53 @@ impl Contract {
             build_account_policies(&env, &config, &normalized.effective_threshold, signers.len());
 
         let account = deployer.deploy_v2(config.smart_account_wasm_hash, (&signers, &policies));
+
+        // Write a persistent registry entry for the newly created account.
+        // The entry records the creation ledger and is immediately extended
+        // to the full REGISTRY_EXTEND_AMOUNT so it survives long dormancy.
+        let registry_key = DataKey::AccountRegistry(account.clone());
+        env.storage().persistent().set(&registry_key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &registry_key,
+            REGISTRY_TTL_THRESHOLD,
+            REGISTRY_EXTEND_AMOUNT,
+        );
+
         AccountCreated { account: account.clone() }.publish(&env);
         account
     }
 
+    /// Returns the ledger sequence at which the given account was created by
+    /// this factory, or `None` if the account is unknown or its registry
+    /// entry has expired.
+    pub fn get_account_created_at(env: Env, account: Address) -> Option<u32> {
+        let registry_key = DataKey::AccountRegistry(account);
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&registry_key)
+            .inspect(|_| {
+                env.storage().persistent().extend_ttl(
+                    &registry_key,
+                    REGISTRY_TTL_THRESHOLD,
+                    REGISTRY_EXTEND_AMOUNT,
+                );
+            })
+    }
+
+    /// Retrieves the configured verifier contract address for a given signer kind.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - Access to the Soroban environment.
+    /// * `signer_kind` - The kind of signer (`Ed25519` or `WebAuthn`).
+    ///
+    /// # Returns
+    ///
+    /// The contract address of the verifier singleton.
+    ///
+    /// # Errors
+    ///
+    /// * [`FactoryError::MissingConfig`] - If factory configuration is not initialized.
     pub fn get_verifier(env: Env, signer_kind: SignerKind) -> Address {
         let config = get_config(&env);
         match signer_kind {
@@ -145,6 +269,19 @@ impl Contract {
         }
     }
 
+    /// Retrieves the configured threshold policy contract address.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - Access to the Soroban environment.
+    ///
+    /// # Returns
+    ///
+    /// The contract address of the threshold policy singleton.
+    ///
+    /// # Errors
+    ///
+    /// * [`FactoryError::MissingConfig`] - If factory configuration is not initialized.
     pub fn get_threshold_policy(env: Env) -> Address {
         get_config(&env).threshold_policy
     }
@@ -202,7 +339,7 @@ fn canonicalize_signers(env: &Env, signers: &Vec<AccountSignerInit>) -> Vec<Acco
         let mut idx = 0u32;
 
         while idx < canonical.len() {
-            let existing = canonical.get(idx).unwrap();
+            let existing = canonical.get(idx).unwrap_or_else(|| panic_with_error!(env, FactoryError::InternalError));
             match compare_signers(&existing, &signer) {
                 core::cmp::Ordering::Equal => {
                     panic_with_error!(env, FactoryError::DuplicateSigner);

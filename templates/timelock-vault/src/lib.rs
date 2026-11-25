@@ -85,6 +85,10 @@ pub enum VaultError {
     StillLocked = 1,
     /// The constructor received an `unlock_ledger` that is not in the future.
     InvalidUnlockLedger = 2,
+    /// A required storage entry (`Owner` or `UnlockLedger`) was not found.
+    /// This can only occur if the contract was never properly initialized or
+    /// if persistent storage was archived without being restored.
+    NotInitialized = 3,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -243,11 +247,19 @@ impl TimelockVault {
     /// * Panics via `require_auth` if caller is not the owner.
     pub fn withdraw(e: Env, token: Address, amount: i128, to: Address) {
         // ── Owner gate ──
-        let owner: Address = e.storage().persistent().get(&DataKey::Owner).unwrap();
+        let owner: Address = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Owner)
+            .unwrap_or_else(|| panic_with_error!(&e, VaultError::NotInitialized));
         owner.require_auth();
 
         // ── Time gate ──
-        let unlock_ledger: u32 = e.storage().persistent().get(&DataKey::UnlockLedger).unwrap();
+        let unlock_ledger: u32 = e
+            .storage()
+            .persistent()
+            .get(&DataKey::UnlockLedger)
+            .unwrap_or_else(|| panic_with_error!(&e, VaultError::NotInitialized));
         if e.ledger().sequence() < unlock_ledger {
             panic_with_error!(&e, VaultError::StillLocked);
         }
@@ -266,12 +278,18 @@ impl TimelockVault {
 
     /// Returns the vault owner's address.
     pub fn get_owner(e: &Env) -> Address {
-        e.storage().persistent().get(&DataKey::Owner).unwrap()
+        e.storage()
+            .persistent()
+            .get(&DataKey::Owner)
+            .unwrap_or_else(|| panic_with_error!(e, VaultError::NotInitialized))
     }
 
     /// Returns the ledger sequence at which withdrawal unlocks.
     pub fn get_unlock_ledger(e: &Env) -> u32 {
-        e.storage().persistent().get(&DataKey::UnlockLedger).unwrap()
+        e.storage()
+            .persistent()
+            .get(&DataKey::UnlockLedger)
+            .unwrap_or_else(|| panic_with_error!(e, VaultError::NotInitialized))
     }
 
     /// Returns the vault's current balance of the given token.
