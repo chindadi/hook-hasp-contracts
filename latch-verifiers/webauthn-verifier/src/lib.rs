@@ -1,11 +1,29 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, xdr::FromXdr, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, panic_with_error, xdr::FromXdr, Bytes, BytesN, Env, Vec};
 use stellar_accounts::verifiers::{
     utils::extract_from_bytes,
     webauthn::{self, WebAuthnSigData},
     Verifier,
 };
+
+/// Input-format errors detected before WebAuthn verification logic runs.
+///
+/// These cover malformed inputs that the upstream `stellar-accounts` crate's
+/// error range (#3111–#3119) does not handle — specifically the decoding step
+/// that happens before any WebAuthn-level check is possible.
+///
+/// Numbered from 1 so raw error codes seen on this contract are unambiguous.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum WebAuthnVerifierError {
+    /// `sig_data` could not be XDR-decoded into a `WebAuthnSigData` struct.
+    InvalidSigDataEncoding = 1,
+    /// `key_data` does not contain a valid 65-byte secp256r1 public key at
+    /// offset 0.
+    InvalidKeyData = 2,
+}
 
 #[contract]
 pub struct WebAuthnVerifier;
@@ -36,11 +54,15 @@ impl Verifier for WebAuthnVerifier {
     ///
     /// `true` if the assertion is valid. Panics on any verification failure.
     fn verify(e: &Env, hash: Bytes, key_data: Bytes, sig_data: Bytes) -> bool {
-        let sig_struct = WebAuthnSigData::from_xdr(e, &sig_data)
-            .expect("sig_data must be a valid XDR-encoded WebAuthnSigData");
+        let sig_struct = match WebAuthnSigData::from_xdr(e, &sig_data) {
+            Ok(s) => s,
+            Err(_) => panic_with_error!(e, WebAuthnVerifierError::InvalidSigDataEncoding),
+        };
 
-        let pub_key: BytesN<65> = extract_from_bytes(e, &key_data, 0..65)
-            .expect("key_data must contain a 65-byte secp256r1 public key at offset 0");
+        let pub_key: BytesN<65> = match extract_from_bytes(e, &key_data, 0..65) {
+            Some(k) => k,
+            None => panic_with_error!(e, WebAuthnVerifierError::InvalidKeyData),
+        };
 
         webauthn::verify(e, &hash, &pub_key, &sig_struct)
     }

@@ -26,6 +26,8 @@ jobs:
   # for status to be reported".
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -45,6 +47,8 @@ jobs:
   fmt:
     needs: changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -82,6 +86,8 @@ jobs:
   discover-workspace:
     needs: changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       workspace_dirs: ${{ steps.list.outputs.workspace_dirs }}
     steps:
@@ -102,6 +108,8 @@ jobs:
   build-and-test:
     needs: [changes, discover-workspace]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -150,6 +158,8 @@ jobs:
   wasm-build:
     needs: changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -175,3 +185,35 @@ jobs:
       - name: Build every contract to WASM (whole workspace)
         if: needs.changes.outputs.code == 'true'
         run: stellar contract build
+
+  verifier-benchmarks:
+    needs: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        if: needs.changes.outputs.code == 'true'
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: stable
+
+      - name: Generate verifier resource benchmark report
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -o pipefail
+          {
+            echo "## Cryptographic Verifier Resource Benchmark Report"
+            echo ""
+            for crate in ed25519-verifier p256-verifier secp256k1-verifier webauthn-verifier; do
+              echo "### \`$crate\`"
+              echo '```text'
+              output="$(cargo test --manifest-path "latch-verifiers/$crate/Cargo.toml" -- --nocapture)"
+              printf '%s\n' "$output" | grep -E "test |representative native verify resources" || true
+              echo '```'
+              echo ""
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+

@@ -145,6 +145,18 @@ happy-path test. Explicitly required by issue #21 as well:
 - `batch_canonicalize_key` — preserves order, single-element case matches `canonicalize_key`
 - Confirm no contract storage is written by any call (statelessness, see §5)
 
+### Wycheproof Test Vector Matrix (`secp256r1`)
+
+| Vector Category | Input Condition | Expected Verifier Outcome |
+|---|---|---|
+| Valid canonical low-S (`tcId: 1..N`) | Uncompressed `0x04` SEC1 point, 32-byte digest, `0 < r < n`, `0 < s <= n / 2` | `verify` returns `true` |
+| High-S malleable signature | Valid `(r, s)` with `n / 2 < s < n` | Rejected (`Error(Crypto, InvalidInput)`) |
+| Zero scalar components | `r == 0` or `s == 0` | Rejected (`Error(Crypto, InvalidInput)`) |
+| Out-of-range scalars | `r >= n` or `s >= n` (where `n` is the P-256 curve order) | Rejected (`Error(Crypto, InvalidInput)`) |
+| Point not on curve / twist point | `0x04` prefix with `(X, Y)` failing $Y^2 \equiv X^3 - 3X + b \pmod p$ | Rejected (`Error(Crypto, InvalidInput)`) |
+| Non-uncompressed SEC1 prefix | `0x00` (infinity), `0x02`/`0x03` (compressed), or `0x06`/`0x07` (hybrid) | Rejected (`Error(Contract, #2)`) |
+| Invalid digest length | Digest length `< 32` or `> 32` bytes | Rejected (`Error(Contract, #1)`) |
+
 ## What This Is Not
 
 - Not a WebAuthn variant — no ceremony, no `clientDataJSON`/`authenticatorData`, no extra digest

@@ -21,7 +21,8 @@ artifacts for 12 of 16 crates; the 4 that differ (`timelock-vault` and
 `multi-token-spending-limit-policy` from the fixes, `latch-smart-account` and
 `factory-contract` from non-behavioural doc-comment/spec changes) need a fresh testnet
 deploy before submission — tracked in [`BUILD.md`](BUILD.md). Threat model in
-[THREAT_MODEL.md](THREAT_MODEL.md); executed test evidence in [TEST_EVIDENCE.md](TEST_EVIDENCE.md).
+[THREAT_MODEL.md](THREAT_MODEL.md); executed test evidence in [TEST_EVIDENCE.md](TEST_EVIDENCE.md);
+formal threshold-policy security proof in [THRESHOLD_POLICY_SECURITY_PROOF.md](THRESHOLD_POLICY_SECURITY_PROOF.md).
 
 ## In scope
 
@@ -60,10 +61,11 @@ checked USD conversion (threat-model `Tamper.2`, PR #90; now 33 tests). See
 deployable shell over audited OZ code, where the interesting questions are wiring and
 authorization (who can call what), not algorithmic.
 
-**Crates with no in-crate tests.** `threshold-policy`, `weighted-threshold-policy` and
-`spending-limit-policy` are single-file wrappers with no test module. `spending-limit-policy`
-is exercised end-to-end by `latch-smart-account`'s tests; the two threshold crates are not
-exercised anywhere in the workspace. Flagging rather than hiding it.
+**Crates with no in-crate tests.** `threshold-policy` and `spending-limit-policy` are
+single-file wrappers with no test module. `spending-limit-policy` is exercised end-to-end by
+`latch-smart-account`'s tests; `threshold-policy` is not exercised anywhere in the workspace.
+`weighted-threshold-policy` now has in-crate tests for the threshold/weight invariant. Flagging
+rather than hiding it.
 
 ## Explicitly out of scope
 
@@ -85,7 +87,9 @@ exercised anywhere in the workspace. Flagging rather than hiding it.
 All OpenZeppelin crates are pinned to `=0.7.2` (`stellar-accounts`, `stellar-contract-utils`,
 `stellar-fee-abstraction`, `stellar-access`, `stellar-macros`, `stellar-tokens`), the latest
 stable release, covered by OZ's own `v0.7.0` audit. `soroban-sdk` is `26.1`. No git or path
-dependencies. `Cargo.lock` is committed.
+dependencies. `Cargo.lock` is committed with immutable cryptographic SHA-256 digests for all
+dependencies. A formal SLSA compliance and build provenance assessment is documented in
+[`SLSA_COMPLIANCE_ASSESSMENT.md`](SLSA_COMPLIANCE_ASSESSMENT.md).
 
 ## Trust assumptions and privileged roles
 
