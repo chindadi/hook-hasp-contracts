@@ -1353,6 +1353,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rate-limit-policy"
+version = "0.0.0"
+dependencies = [
+ "soroban-sdk",
+ "stellar-accounts",
+]
+
+[[package]]
 name = "recipient-allowlist-policy"
 version = "0.0.0"
 dependencies = [

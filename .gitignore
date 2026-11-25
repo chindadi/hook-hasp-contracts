@@ -16,6 +16,10 @@ memory/
 # Soroban test snapshots
 **/test_snapshots/
 
+# Python bytecode cache
+__pycache__/
+*.pyc
+
 # workspaces
 latch-contracts.code-workspace
 
